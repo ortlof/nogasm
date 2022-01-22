@@ -8,7 +8,10 @@
  * 
  * [Red]    Manual Vibrator Control
  * [Blue]   Automatic vibrator edging, knob adjusts orgasm detection sensitivity
+ * Menue Colors
  * [Green]  Setting menu for maximum vibrator speed in automatic mode
+ * [Blue]   Settings menu for Pause Time 0-39 sek.
+ * [Red]    Settings menu for Ramp Time 0-78 sek. 
  * [White]  Debubbing menu to show data from the pressure sensor ADC
  * [Off]    While still plugged in, holding the button down for >3 seconds turns
  *          the whole device off, until the button is pressed again.
@@ -93,8 +96,8 @@ int sensitivity = 0; //orgasm detection sensitivity, persists through different 
 #define MANUAL      1
 #define AUTO        2
 #define OPT_SPEED   3
-#define OPT_RAMPSPD 4
-#define OPT_BEEP    5
+#define OPT_PTIME   4
+#define OPT_RTIME    5
 #define OPT_PRES    6
 
 
@@ -113,24 +116,30 @@ bool SW2 =        false;
 bool SW3 =        false;
 bool SW4 =        false;
 #define MOT_MIN 35  // Motor PWM minimum.  It needs a little more than this to start.
+#define DEFAULT_RTIME 20 // Default RampTime Value is safed in Eproom
+#define DEFAULT_PTIME 10 // Default Pause Time Value is safed in Eproom
 
 CRGB leds[NUM_LEDS];
 
 int pressure = 0;
 int avgPressure = 0; //Running 25 second average pressure
 //int bri =100; //Brightness setting
-int rampTimeS = 30; //Ramp-up time, in seconds
+int rampTimeS = DEFAULT_RTIME; //Ramp-up time, in seconds
+int rampPTime = DEFAULT_PTIME; //Pause time, in seconds
+
 #define DEFAULT_PLIMIT 600
 int pLimit = DEFAULT_PLIMIT; //Limit in change of pressure before the vibrator turns off
 int maxSpeed = 255; //maximum speed the motor will ramp up to in automatic mode
-float motSpeed = 0; //Motor speed, 0-255 (float to maintain smooth ramping to low speeds)
+float motSpeed = MOT_MIN; //Motor speed, 0-255 (float to maintain smooth ramping to low speeds)
+unsigned long Time;
 
 //=======EEPROM Addresses============================
 //128b available on teensy LC
 #define BEEP_ADDR         1
 #define MAX_SPEED_ADDR    2
 #define SENSITIVITY_ADDR  3
-//#define RAMPSPEED_ADDR    4 //For now, ramp speed adjustments aren't implemented
+#define RAMPPAUSET_ADDR   4 
+#define RAMPTIME_ADDR    5
 
 //=======Setup=======================================
 //Beep out tones over the motor by frequency (1047,1396,2093) may work well
@@ -197,6 +206,8 @@ void setup() {
   //Recall saved settings from memory
   sensitivity = EEPROM.read(SENSITIVITY_ADDR);
   maxSpeed = min(EEPROM.read(MAX_SPEED_ADDR),MOT_MAX); //Obey the MOT_MAX the first power  cycle after chaning it.
+  rampPTime = EEPROM.read(RAMPPAUSET_ADDR);
+  rampTimeS = EEPROM.read(RAMPTIME_ADDR);
   beep_motor(1047,1396,2093); //Power on beep
 }
 
@@ -265,16 +276,19 @@ int encLimitRead(int minVal, int maxVal){
 
 // Manual vibrator control mode (red), still shows orgasm closeness in background
 void run_manual() {
-  //In manual mode, only allow for 13 cursor positions, for adjusting motor speed.
+  //In manual mode, only allow for 36 cursor positions, for adjusting motor speed.
   int knob = encLimitRead(0,36);
-  motSpeed = map(knob, 0, 36, 0., (float)MOT_MAX);
-  analogWrite(MOTPIN, motSpeed);
+  motSpeed = map(knob, 0, 36, (float)(MOT_MIN-5), (float)MOT_MAX);
+    if (motSpeed > (MOT_MIN)) {
+    analogWrite(MOTPIN, (int) motSpeed);
+  } else {
+    analogWrite(MOTPIN, 0);
+  }
 
   //gyrGraphDraw(avgPressure, 0, 4 * 3 * NUM_LEDS);
   int presDraw = map(constrain(pressure - avgPressure, 0, pLimit),0,pLimit,0,NUM_LEDS*3);
   draw_bars_3(presDraw, CRGB::Green,CRGB::Yellow,CRGB::Red);
-  //draw_cursor(knob, CRGB::Red);
-  draw_cursor_3(knob, CRGB::Red,CRGB::Purple,CRGB::Blue);
+  draw_cursor_3(knob, CRGB::Red,CRGB::Purple,CRGB::Blue);  // Changed to 37 motor positions and 3 color 
 }
 
 // Automatic edging mode, knob adjust sensitivity.
@@ -288,12 +302,12 @@ void run_auto() {
   pLimit = map(knob, 0, 3 * (NUM_LEDS - 1), 600, 1); //set the limit of delta pressure before the vibrator turns off
   //When someone clenches harder than the pressure limit
   if (pressure - avgPressure > pLimit) {
-    motSpeed = -.5*(float)rampTimeS*((float)FREQUENCY*motIncrement);//Stay off for a while (half the ramp up time)
+    motSpeed = -(float)rampPTime*((float)FREQUENCY*motIncrement)+MOT_MIN;//Stay off for Pause Time
   }
   else if (motSpeed < (float)maxSpeed) {
     motSpeed += motIncrement;
   }
-  if (motSpeed > MOT_MIN) {
+  if (motSpeed > (MOT_MIN+1)) {
     analogWrite(MOTPIN, (int) motSpeed);
   } else {
     analogWrite(MOTPIN, 0);
@@ -319,14 +333,22 @@ void run_opt_speed() {
   draw_bars_3(map(visRamp,0,(NUM_LEDS-1)*FREQUENCY,0,knob),CRGB::Green,CRGB::Green,CRGB::Green);
 }
 
-//Not yet added, but adjusts how quickly the vibrator turns back on after being triggered off
-void run_opt_rampspd() {
-  Serial.println("rampSpeed");
+//Settings menu for Pause Time. IT is set in 1 seconds per led so 39 Seconds MAX
+void run_opt_ptime() {
+  Serial.println("PauseTime");
+  Serial.println(rampPTime);
+  int knob = encLimitRead(0,39);
+  rampPTime = map(knob, 0, 39, 0, 39);
+  draw_cursor_3(knob, CRGB::Red,CRGB::Blue,CRGB::Purple);
 }
 
-//Also not completed, option for enabling/disabling beeps
-void run_opt_beep() {
-  Serial.println("Brightness Settings");
+//Settings menu for Ramp Time. IT is set in 2 seconds per led so 78 Seconds MAX
+void run_opt_rtime() { 
+  Serial.println("RampTime");
+  Serial.println(rampTimeS);
+  int knob = encLimitRead(0,39);
+  rampTimeS = map(knob, 0, 39, 0, 78);
+  draw_cursor_3(knob, CRGB::Red,CRGB::Blue,CRGB::Purple);
 }
 
 //Simply display the pressure analog voltage. Useful for debugging sensitivity issues.
@@ -378,13 +400,13 @@ void run_state_machine(uint8_t state){
         showKnobRGB(CRGB::Green);
         run_opt_speed();
         break;
-      case OPT_RAMPSPD:
-        showKnobRGB(CRGB::Yellow);
-        run_opt_rampspd();
+      case OPT_PTIME:
+        showKnobRGB(CRGB::Blue);
+        run_opt_ptime();
         break;
-      case OPT_BEEP:
-        showKnobRGB(CRGB::Purple);
-        run_opt_beep();
+      case OPT_RTIME:
+        showKnobRGB(CRGB::Red);
+        run_opt_rtime();
         break;
       case OPT_PRES:
         showKnobRGB(CRGB::White);
@@ -419,7 +441,7 @@ uint8_t set_state(uint8_t btnState, uint8_t state){
     switch(state){
       case MANUAL:
         myEnc.write(sensitivity);//Whenever going into auto mode, keep the last sensitivity
-        motSpeed = 0; //Also reset the motor speed to 0
+        motSpeed = MOT_MIN; //Also reset the motor speed to 0
         return AUTO;
       case AUTO:
         myEnc.write(0);//Whenever going into manual mode, set the speed to 0.
@@ -427,18 +449,17 @@ uint8_t set_state(uint8_t btnState, uint8_t state){
         EEPROM.update(SENSITIVITY_ADDR, sensitivity);
         return MANUAL;
       case OPT_SPEED:
-        myEnc.write(0);
+        myEnc.write(rampPTime*4);  
         EEPROM.update(MAX_SPEED_ADDR, maxSpeed);
-        //return OPT_RAMPSPD;
-        //return OPT_BEEP;
         motSpeed = 0;
         analogWrite(MOTPIN, motSpeed); //Turn the motor off for the white pressure monitoring mode
-        return OPT_PRES; //Skip beep and rampspeed settings for now
-      case OPT_RAMPSPD: //Not yet implimented
-        //motSpeed = 0;
-        //myEnc.write(0);
-        return OPT_BEEP;
-      case OPT_BEEP:
+        return OPT_PTIME;
+      case OPT_PTIME:
+        EEPROM.update(RAMPPAUSET_ADDR, rampPTime);
+        myEnc.write(rampTimeS*4);  
+        return OPT_RTIME;
+      case OPT_RTIME:
+        EEPROM.update(RAMPTIME_ADDR, rampTimeS);
         myEnc.write(0);
         return OPT_PRES;
       case OPT_PRES:
@@ -455,25 +476,28 @@ uint8_t set_state(uint8_t btnState, uint8_t state){
             myEnc.write(map(maxSpeed,0,255,0,4*(NUM_LEDS)));//start at saved value
             return OPT_SPEED;
           case OPT_SPEED:
+            EEPROM.update(MAX_SPEED_ADDR, maxSpeed);
             myEnc.write(0);
             return MANUAL;
-          case OPT_RAMPSPD:
+          case OPT_PTIME:
+            EEPROM.update(RAMPPAUSET_ADDR, rampPTime);
+            myEnc.write(0);
             return MANUAL;
-          case OPT_BEEP:
+          case OPT_RTIME:
+            EEPROM.update(RAMPTIME_ADDR, rampTimeS);
+            myEnc.write(0);
             return MANUAL;
           case OPT_PRES:
             myEnc.write(0);
             return MANUAL;
         }
-  }
-  else return MANUAL;
+  } else return MANUAL;
 }
 
 //=======Main Loop=============================
 void loop() {
   static uint8_t state = MANUAL;
-  static int sampleTick = 0;
-  //Run this section at the update frequency (default 60 Hz)
+  static int sampleTick = 0; //Run this section at the update frequency (default 60 Hz)
   if (millis() % period == 0) {
     delay(1);
     
@@ -492,7 +516,6 @@ void loop() {
 
     //Alert that the Pressure voltage amplifier is railing, and the trim pot needs to be adjusted
     if(pressure > 4030)beep_motor(2093,2093,2093); //Three high beeps
-
     //Report pressure and motor data over USB for analysis / other uses. timestamps disabled by default
     //Serial.print(millis()); //Timestamp (ms)
     //Serial.print(",");
@@ -500,7 +523,11 @@ void loop() {
     Serial.print(",");
     Serial.print(pressure); //(Original ADC value - 12 bits, 0-4095)
     Serial.print(",");
-    Serial.println(avgPressure); //Running average of (default last 25 seconds) pressure
-
+    Serial.print(avgPressure); //Running average of (default last 25 seconds) pressure
+    Serial.print(",");
+    Serial.print(rampPTime);
+    Serial.print(",");
+    Serial.print(rampTimeS);
+    Serial.println(",");
   }
 }

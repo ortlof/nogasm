@@ -17,3 +17,16 @@ The detection algorithm uses a circular buffer for calculating a running average
 
 
 This work is licensed under a Creative Commons Attribution-NonCommercial 4.0 International Licence, available at http://creativecommons.org/licenses/by-nc/4.0/.
+
+#### Control Update in New Code
+
+Mode Long Press
+Green -> Adjust Peak Speed 
+Blue  -> Adjust Pause Time 0-39 Sec. (Time which the Vibrator stops after detection)
+Red   -> Adjust Ramp up Speed 0-78 Sec. 
+
+Mode Short Press
+
+Manual 
+Automatic Edging
+
