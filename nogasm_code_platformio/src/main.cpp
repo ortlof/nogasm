@@ -1,4 +1,4 @@
-// Jul 2016 - Nogasm Code Rev. 3
+// Jul 2022 - Nogasm Code Ortlof
 /* Drives a vibrator and uses changes in pressure of an inflatable buttplug
  * to estimate a user's closeness to orgasm, and turn off the vibrator
  * before that point.
@@ -49,6 +49,10 @@
 #include <EEPROM.h>
 #include "FastLED.h"
 #include "RunningAverage.h"
+#include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
 //=======Hardware Setup===============================
 //LEDs
@@ -56,7 +60,13 @@
 #define LED_PIN 17 //5V buffered pin on Teensy LC, single wire data out to WS8212Bs
 #define LED_TYPE    WS2812B
 #define COLOR_ORDER GRB
-#define BRIGHTNESS 255 //Subject to change, limits current that the LEDs draw
+
+//LCD
+#define SCREEN_WIDTH 128 // OLED display width, in pixels
+#define SCREEN_HEIGHT 64 // OLED display height, in pixels
+#define OLED_RESET     4 // Reset pin # (or -1 if sharing Arduino reset pin)
+#define SCREEN_ADDRESS 0x3C ///< See datasheet for Address; 0x3D for 128x64, 0x3C for 128x32
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 //Encoder
 #define REDPIN   5 //RGB pins of the encoder LED
@@ -84,6 +94,7 @@ Encoder myEnc(8, 7); //Quadrature inputs on pins 7,8
 
 //Update/render period
 #define period (1000/FREQUENCY)
+#define lcdperiod (1000/FREQUENCY)
 #define longBtnCount (LONG_PRESS_MS / period)
 
 //Running pressure average array length and update frequency
@@ -96,12 +107,12 @@ int sensitivity = 0; //orgasm detection sensitivity, persists through different 
 //=======State Machine Modes=========================
 #define MANUAL      1
 #define AUTO        2
-#define OPT_SPEED   3
-#define OPT_PTIME   4
-#define OPT_RTIME    5
-#define OPT_PRES    6
-#define AUTORAMP    7
-
+#define AUTORAMP    3
+#define OPT_SPEED   4
+#define OPT_PTIME   5
+#define OPT_RTIME   6
+#define OPT_BRI     7
+#define OPT_PRES    8
 
 //Button states - no press, short press, long press
 #define BTN_NONE   0
@@ -120,21 +131,23 @@ bool SW4 =        false;
 #define MOT_MIN 35  // Motor PWM minimum.  It needs a little more than this to start.
 #define DEFAULT_RTIME 20 // Default RampTime Value is safed in Eproom
 #define DEFAULT_PTIME 10 // Default Pause Time Value is safed in Eproom
+#define DEFAULT_BRIGHTNESS 255 //Subject to change, limits current that the LEDs draw
 
 CRGB leds[NUM_LEDS];
 
 int pressure = 0;
 int avgPressure = 0; //Running 25 second average pressure
-//int bri =100; //Brightness setting
+int bri = DEFAULT_BRIGHTNESS; //Brightness setting
 int rampTimeS = DEFAULT_RTIME; //Ramp-up time, in seconds
 int rampPTime = DEFAULT_PTIME; //Pause time, in seconds
 float autoRTime;
-bool ramp;
+bool pflag;
 
 #define DEFAULT_PLIMIT 600
 int pLimit = DEFAULT_PLIMIT; //Limit in change of pressure before the vibrator turns off
 int maxSpeed = 255; //maximum speed the motor will ramp up to in automatic mode
 float motSpeed = MOT_MIN; //Motor speed, 0-255 (float to maintain smooth ramping to low speeds)
+int pcounter = 0;
 unsigned long Time;
 
 //=======EEPROM Addresses============================
@@ -143,7 +156,8 @@ unsigned long Time;
 #define MAX_SPEED_ADDR    2
 #define SENSITIVITY_ADDR  3
 #define RAMPPAUSET_ADDR   4 
-#define RAMPTIME_ADDR    5
+#define RAMPTIME_ADDR     5
+#define BRIGHTNESS_ADDR   6
 
 //=======Setup=======================================
 //Beep out tones over the motor by frequency (1047,1396,2093) may work well
@@ -161,6 +175,11 @@ void beep_motor(int f1, int f2, int f3){
 }
 
 void setup() {
+   if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for(;;); // Don't proceed, loop forever
+  }
+
   pinMode(REDPIN,   OUTPUT); //Connected to RGB LED in the encoder
   pinMode(GREENPIN, OUTPUT);
   pinMode(BLUEPIN,  OUTPUT);
@@ -201,18 +220,24 @@ void setup() {
   SW4 = (digitalRead(SW4PIN) == LOW);
 
   Serial.begin(115200);
-
-  FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS).setCorrection(TypicalLEDStrip);
-  // limit power draw to .6A at 5v... Didn't seem to work in my FastLED version though
-  //FastLED.setMaxPowerInVoltsAndMilliamps(5,DEFAULT_PLIMIT);
-  FastLED.setBrightness(BRIGHTNESS);
-
+  
   //Recall saved settings from memory
   sensitivity = EEPROM.read(SENSITIVITY_ADDR);
   maxSpeed = min(EEPROM.read(MAX_SPEED_ADDR),MOT_MAX); //Obey the MOT_MAX the first power  cycle after chaning it.
   rampPTime = EEPROM.read(RAMPPAUSET_ADDR);
   rampTimeS = EEPROM.read(RAMPTIME_ADDR);
+  bri = EEPROM.read(BRIGHTNESS_ADDR);
+
+  FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS).setCorrection(TypicalLEDStrip);
+  // limit power draw to .6A at 5v... Didn't seem to work in my FastLED version though
+  //FastLED.setMaxPowerInVoltsAndMilliamps(5,DEFAULT_PLIMIT);
+  FastLED.setBrightness(bri);
+
+
   beep_motor(1047,1396,2093); //Power on beep
+  display.clearDisplay();
+  display.stopscroll();
+  display.display();
 }
 
 //=======LED Drawing Functions=================
@@ -276,6 +301,50 @@ int encLimitRead(int minVal, int maxVal){
   return constrain(myEnc.read()/4,minVal,maxVal);
 }
 
+//=======LCD Programs=========================
+
+void lcd_auto(int presDraw, String mode){
+  int motspeedp = map(motSpeed, 0, 255, 0, 100);
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.setTextColor(WHITE); 
+  display.setTextSize(1);
+  display.print("Mode:");
+  display.setCursor(90,0);
+  display.println(mode);
+  display.setCursor(0,10);
+  display.print("Pressure:");
+  display.setCursor(90,10);
+  display.println(presDraw);
+  display.setCursor(0,20);
+  display.print("Vibr_Speed:");
+  display.setCursor(90,20);
+  display.println(motspeedp);
+  display.setCursor(110,20);
+  display.print("%");
+  display.setCursor(0,30);
+  display.print("Press Limit:");
+  display.setCursor(90,30);
+  display.print(pLimit);
+  display.setCursor(0,40);
+  display.print("Edge Counter:");
+  display.setCursor(90,40);
+  display.print(pcounter);
+}
+
+void lcd_settings(String setting, String tag1, int value1){
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.setTextColor(WHITE); 
+  display.setTextSize(1);
+  display.print("Settings");
+  display.setCursor(0,10);
+  display.println(setting);
+  display.setCursor(0,30);
+  display.print(tag1);
+  display.setCursor(90,30);
+  display.println(value1);
+}
 //=======Program Modes/States==================
 
 // Manual vibrator control mode (red), still shows orgasm closeness in background
@@ -293,6 +362,24 @@ void run_manual() {
   int presDraw = map(constrain(pressure - avgPressure, 0, pLimit),0,pLimit,0,NUM_LEDS*3);
   draw_bars_3(presDraw, CRGB::Green,CRGB::Yellow,CRGB::Red);
   draw_cursor_3(knob, CRGB::Red,CRGB::Purple,CRGB::Blue);  // Changed to 37 motor positions and 3 color 
+  int motspeedp = map(motSpeed, 0, 255, 0, 100);
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.setTextColor(WHITE); 
+  display.setTextSize(1);
+  display.print("Mode: ");
+  display.setCursor(90,0);
+  display.println("Manual");
+  display.setCursor(0,10);
+  display.print("Pressure: ");
+  display.setCursor(90,10);
+  display.println(presDraw);
+  display.setCursor(0,20);
+  display.print("Vibr_Speed: ");
+  display.setCursor(90,20);
+  display.println(motspeedp);
+  display.setCursor(110,20);
+  display.print("%");
 }
 
 // Automatic edging mode, knob adjust sensitivity.
@@ -307,12 +394,17 @@ void run_auto() {
   //When someone clenches harder than the pressure limit
   if (pressure - avgPressure > pLimit) {
     motSpeed = -(float)rampPTime*((float)FREQUENCY*motIncrement)+MOT_MIN;//Stay off for Pause Time
+    if (pflag == false) {
+      pcounter = pcounter + 1;
+      pflag = true;
+    }
   }
   else if (motSpeed < (float)maxSpeed) {
     motSpeed += motIncrement;
   }
   if (motSpeed > (MOT_MIN+1)) {
     analogWrite(MOTPIN, (int) motSpeed);
+    pflag = false;
   } else {
     analogWrite(MOTPIN, 0);
   }
@@ -320,9 +412,10 @@ void run_auto() {
   int presDraw = map(constrain(pressure - avgPressure, 0, pLimit),0,pLimit,0,NUM_LEDS*3);
   draw_bars_3(presDraw, CRGB::Green,CRGB::Yellow,CRGB::Red);
   draw_cursor_3(knob, CRGB(50,50,200),CRGB::Blue,CRGB::Purple);
-
+  String mode = "Auto";
+  lcd_auto(presDraw, mode);
 }
-
+// Automatic edging mode, knob adjust sensitivity. With Ramping Pause time. 
 void run_auto_ramp() {
   static float motIncrement = 0.0;
   motIncrement = ((float)maxSpeed / ((float)FREQUENCY * (float)rampTimeS));
@@ -334,9 +427,10 @@ void run_auto_ramp() {
   //When someone clenches harder than the pressure limit
   if (pressure - avgPressure > pLimit) {
     motSpeed = -(float)autoRTime*((float)FREQUENCY*motIncrement)+MOT_MIN;//Stay off for Pause Time
-    if (ramp == false) {
+    if (pflag == false) {
       autoRTime = autoRTime + 0.25;
-      ramp = true;
+      pcounter = pcounter + 1;
+      pflag = true;
     }
     
   }
@@ -345,7 +439,7 @@ void run_auto_ramp() {
   }
   if (motSpeed > (MOT_MIN+1)) {
     analogWrite(MOTPIN, (int) motSpeed);
-    ramp = false;
+    pflag = false;
   } else {
     analogWrite(MOTPIN, 0);
   }
@@ -353,12 +447,13 @@ void run_auto_ramp() {
   int presDraw = map(constrain(pressure - avgPressure, 0, pLimit),0,pLimit,0,NUM_LEDS*3);
   draw_bars_3(presDraw, CRGB::Green,CRGB::Yellow,CRGB::Red);
   draw_cursor_3(knob, CRGB(50,50,200),CRGB::Blue,CRGB::Purple);
-
+  String mode = "Ramp";
+  lcd_auto(presDraw, mode);
 }
 
 //Setting menu for adjusting the maximum vibrator speed automatic mode will ramp up to
 void run_opt_speed() {
-  Serial.println("speed settings");
+  //Serial.println("speed settings");
   int knob = encLimitRead(0,12);
   motSpeed = map(knob, 0, 12, 0., (float)MOT_MAX);
   analogWrite(MOTPIN, motSpeed);
@@ -368,30 +463,60 @@ void run_opt_speed() {
   if(visRamp <= FREQUENCY*NUM_LEDS-1) visRamp += 16;
   else visRamp = 0;
   draw_bars_3(map(visRamp,0,(NUM_LEDS-1)*FREQUENCY,0,knob),CRGB::Green,CRGB::Green,CRGB::Green);
+  String setting = ("Speed");
+  String tag1 = ("Max Speed:");
+  int value1 = motSpeed;
+  lcd_settings(setting, tag1, value1);
 }
 
 //Settings menu for Pause Time. IT is set in 1 seconds per led so 39 Seconds MAX
 void run_opt_ptime() {
-  Serial.println("PauseTime");
-  Serial.println(rampPTime);
+ // Serial.println("PauseTime");
+ // Serial.println(rampPTime);
   int knob = encLimitRead(0,39);
   rampPTime = map(knob, 0, 39, 0, 39);
   draw_cursor_3(knob, CRGB::Red,CRGB::Blue,CRGB::Purple);
+  String setting = ("Coldown Time Min");
+  String tag1 = ("Seconds:");
+  int value1 = rampPTime;
+  lcd_settings(setting, tag1, value1);
 }
 
 //Settings menu for Ramp Time. IT is set in 2 seconds per led so 78 Seconds MAX
 void run_opt_rtime() { 
-  Serial.println("RampTime");
-  Serial.println(rampTimeS);
+ // Serial.println("RampTime");
+ // Serial.println(rampTimeS);
   int knob = encLimitRead(0,39);
   rampTimeS = map(knob, 0, 39, 0, 78);
   draw_cursor_3(knob, CRGB::Red,CRGB::Blue,CRGB::Purple);
+  String setting = ("Ramp Time");
+  String tag1 = ("Seconds:");
+  int value1 = rampTimeS;
+  lcd_settings(setting, tag1, value1);
+}
+
+//Settings menu for Brightness 
+void run_opt_bright() { 
+  //Serial.println("Brightness");
+  //Serial.println(bri);
+  int knob = encLimitRead(0,39);
+  bri = map(knob, 0, 39, 0, 255);
+  FastLED.setBrightness(bri);
+  draw_cursor(6, CRGB::White);
+  String setting = ("Brightness");
+  String tag1 = ("Brightness:");
+  int value1 = bri;
+  lcd_settings(setting, tag1, value1);
 }
 
 //Simply display the pressure analog voltage. Useful for debugging sensitivity issues.
 void run_opt_pres() {
   int p = map(analogRead(BUTTPIN),0,4095,0,NUM_LEDS-1);
   draw_cursor(p,CRGB::White);
+  String setting = ("Pressure Debug");
+  String tag1 = ("Pressure:");
+  int value1 = p;
+  lcd_settings(setting, tag1, value1);
 }
 
 //Poll the knob click button, and check for long/very long presses as well
@@ -449,6 +574,10 @@ void run_state_machine(uint8_t state){
         showKnobRGB(CRGB::Red);
         run_opt_rtime();
         break;
+      case OPT_BRI:
+        showKnobRGB(CRGB::Violet);
+        run_opt_bright();
+        break;
       case OPT_PRES:
         showKnobRGB(CRGB::White);
         run_opt_pres();
@@ -483,11 +612,13 @@ uint8_t set_state(uint8_t btnState, uint8_t state){
       case MANUAL:
         myEnc.write(sensitivity);//Whenever going into auto mode, keep the last sensitivity
         motSpeed = MOT_MIN; //Also reset the motor speed to 0
+        pcounter = 0; //When going in auto Restet Pause Counter.
         return AUTO;
       case AUTO:
         myEnc.write(sensitivity);//Whenever going into autoramp mode, keep the last sensitivity
         motSpeed = MOT_MIN; //Also reset the motor speed to 0
-        autoRTime = rampPTime;
+        autoRTime = rampPTime; //When going in auto Restet Pause Counter.
+        pcounter = 0;
       return AUTORAMP;
       case AUTORAMP:
         myEnc.write(0);//Whenever going into manual mode, set the speed to 0.
@@ -495,17 +626,22 @@ uint8_t set_state(uint8_t btnState, uint8_t state){
         EEPROM.update(SENSITIVITY_ADDR, sensitivity);
         return MANUAL;
       case OPT_SPEED:
-        myEnc.write(rampPTime*4);  
+        myEnc.write(rampPTime);
         EEPROM.update(MAX_SPEED_ADDR, maxSpeed);
         motSpeed = 0;
         analogWrite(MOTPIN, motSpeed); //Turn the motor off for the white pressure monitoring mode
         return OPT_PTIME;
       case OPT_PTIME:
         EEPROM.update(RAMPPAUSET_ADDR, rampPTime);
-        myEnc.write(rampTimeS*4);  
-        return OPT_RTIME;
+        myEnc.write(map(rampTimeS, 0, 39, 0, (78*4)));
+      return OPT_RTIME;
       case OPT_RTIME:
         EEPROM.update(RAMPTIME_ADDR, rampTimeS);
+        myEnc.write(map(bri, 0, 39, 0, (255*4)));
+        return OPT_BRI;
+      case OPT_BRI:
+        EEPROM.update(BRIGHTNESS_ADDR, bri);
+        FastLED.setBrightness(bri);
         myEnc.write(0);
         return OPT_PRES;
       case OPT_PRES:
@@ -536,6 +672,10 @@ uint8_t set_state(uint8_t btnState, uint8_t state){
             EEPROM.update(RAMPTIME_ADDR, rampTimeS);
             myEnc.write(0);
             return MANUAL;
+          case OPT_BRI:
+            EEPROM.update(BRIGHTNESS_ADDR, bri);
+            myEnc.write(0);
+            return MANUAL;
           case OPT_PRES:
             myEnc.write(0);
             return MANUAL;
@@ -549,7 +689,9 @@ void loop() {
   static int sampleTick = 0; //Run this section at the update frequency (default 60 Hz)
   if (millis() % period == 0) {
     delay(1);
-    
+
+    display.stopscroll();
+    display.display();
     sampleTick++; //Add pressure samples to the running average slower than 60Hz
     if (sampleTick % RA_TICK_PERIOD == 0) {
       raPressure.addValue(pressure);
@@ -568,17 +710,20 @@ void loop() {
     //Report pressure and motor data over USB for analysis / other uses. timestamps disabled by default
     //Serial.print(millis()); //Timestamp (ms)
     //Serial.print(",");
-    Serial.print(motSpeed); //Motor speed (0-255)
-    Serial.print(",");
-    Serial.print(pressure); //(Original ADC value - 12 bits, 0-4095)
-    Serial.print(",");
-    Serial.print(avgPressure); //Running average of (default last 25 seconds) pressure
-    Serial.print(",");
-    Serial.print(rampPTime);
-    Serial.print(",");
-    Serial.print(rampTimeS);
-    Serial.print(",");
-    Serial.print(autoRTime);
-    Serial.println(",");
+    //Serial.print(motSpeed); //Motor speed (0-255)
+    //Serial.print(",");
+    //Serial.print(pressure); //(Original ADC value - 12 bits, 0-4095)
+    //Serial.print(",");
+    //Serial.print(avgPressure); //Running average of (default last 25 seconds) pressure
+   // Serial.print(",");
+    //Serial.print(rampPTime);
+    //Serial.print(",");
+    //Serial.print(rampTimeS);
+   // Serial.print(",");
+   // Serial.print(autoRTime);
+   // Serial.print(",");
+   // Serial.print(bri);
+   // Serial.println(",");
+   // Serial.println(",");
   }
 }
