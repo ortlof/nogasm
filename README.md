@@ -27,6 +27,6 @@ Red   -> Adjust Ramp up Speed 0-78 Sec.
 
 Mode Short Press
 
-Manual 
-Automatic Edging
-
+Red		->	Manual 
+Blue 	-> 	Automatic Edging 
+Green	->	Automatic Edging With Ramp (Each Pause adds 0.25 seconds add the next cool down. 

@@ -8,6 +8,7 @@
  * 
  * [Red]    Manual Vibrator Control
  * [Blue]   Automatic vibrator edging, knob adjusts orgasm detection sensitivity
+ * [Green]  Automatic vibrator edging with Pause Ramp up 0.25 sek at ever pause, knob adjusts orgasm detection sensitivity
  * Menue Colors
  * [Green]  Setting menu for maximum vibrator speed in automatic mode
  * [Blue]   Settings menu for Pause Time 0-39 sek.
@@ -99,6 +100,7 @@ int sensitivity = 0; //orgasm detection sensitivity, persists through different 
 #define OPT_PTIME   4
 #define OPT_RTIME    5
 #define OPT_PRES    6
+#define AUTORAMP    7
 
 
 //Button states - no press, short press, long press
@@ -126,6 +128,8 @@ int avgPressure = 0; //Running 25 second average pressure
 //int bri =100; //Brightness setting
 int rampTimeS = DEFAULT_RTIME; //Ramp-up time, in seconds
 int rampPTime = DEFAULT_PTIME; //Pause time, in seconds
+float autoRTime;
+bool ramp;
 
 #define DEFAULT_PLIMIT 600
 int pLimit = DEFAULT_PLIMIT; //Limit in change of pressure before the vibrator turns off
@@ -319,6 +323,39 @@ void run_auto() {
 
 }
 
+void run_auto_ramp() {
+  static float motIncrement = 0.0;
+  motIncrement = ((float)maxSpeed / ((float)FREQUENCY * (float)rampTimeS));
+
+  int knob = encLimitRead(0,(3*NUM_LEDS)-1);
+  sensitivity = knob*4; //Save the setting if we leave and return to this state
+  //Reverse "Knob" to map it onto a pressure limit, so that it effectively adjusts sensitivity
+  pLimit = map(knob, 0, 3 * (NUM_LEDS - 1), 600, 1); //set the limit of delta pressure before the vibrator turns off
+  //When someone clenches harder than the pressure limit
+  if (pressure - avgPressure > pLimit) {
+    motSpeed = -(float)autoRTime*((float)FREQUENCY*motIncrement)+MOT_MIN;//Stay off for Pause Time
+    if (ramp == false) {
+      autoRTime = autoRTime + 0.25;
+      ramp = true;
+    }
+    
+  }
+  else if (motSpeed < (float)maxSpeed) {
+    motSpeed += motIncrement;
+  }
+  if (motSpeed > (MOT_MIN+1)) {
+    analogWrite(MOTPIN, (int) motSpeed);
+    ramp = false;
+  } else {
+    analogWrite(MOTPIN, 0);
+  }
+
+  int presDraw = map(constrain(pressure - avgPressure, 0, pLimit),0,pLimit,0,NUM_LEDS*3);
+  draw_bars_3(presDraw, CRGB::Green,CRGB::Yellow,CRGB::Red);
+  draw_cursor_3(knob, CRGB(50,50,200),CRGB::Blue,CRGB::Purple);
+
+}
+
 //Setting menu for adjusting the maximum vibrator speed automatic mode will ramp up to
 void run_opt_speed() {
   Serial.println("speed settings");
@@ -396,6 +433,10 @@ void run_state_machine(uint8_t state){
         showKnobRGB(CRGB::Blue);
         run_auto();
         break;
+      case AUTORAMP:
+        showKnobRGB(CRGB::Green);
+        run_auto_ramp();
+        break;
       case OPT_SPEED:
         showKnobRGB(CRGB::Green);
         run_opt_speed();
@@ -444,6 +485,11 @@ uint8_t set_state(uint8_t btnState, uint8_t state){
         motSpeed = MOT_MIN; //Also reset the motor speed to 0
         return AUTO;
       case AUTO:
+        myEnc.write(sensitivity);//Whenever going into autoramp mode, keep the last sensitivity
+        motSpeed = MOT_MIN; //Also reset the motor speed to 0
+        autoRTime = rampPTime;
+      return AUTORAMP;
+      case AUTORAMP:
         myEnc.write(0);//Whenever going into manual mode, set the speed to 0.
         motSpeed = 0;
         EEPROM.update(SENSITIVITY_ADDR, sensitivity);
@@ -473,6 +519,9 @@ uint8_t set_state(uint8_t btnState, uint8_t state){
             myEnc.write(map(maxSpeed,0,255,0,4*(NUM_LEDS)));//start at saved value
             return OPT_SPEED;
           case AUTO:
+            myEnc.write(map(maxSpeed,0,255,0,4*(NUM_LEDS)));//start at saved value
+            return OPT_SPEED;
+          case AUTORAMP:
             myEnc.write(map(maxSpeed,0,255,0,4*(NUM_LEDS)));//start at saved value
             return OPT_SPEED;
           case OPT_SPEED:
@@ -528,6 +577,8 @@ void loop() {
     Serial.print(rampPTime);
     Serial.print(",");
     Serial.print(rampTimeS);
+    Serial.print(",");
+    Serial.print(autoRTime);
     Serial.println(",");
   }
 }
